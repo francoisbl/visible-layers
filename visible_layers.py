@@ -3,7 +3,9 @@ from qgis.PyQt.QtWidgets import (
     QVBoxLayout, QWidget, QToolButton, QToolBar, QMenu,
 )
 from qgis.PyQt.QtGui import QIcon
-from qgis.PyQt.QtCore import Qt, QSize, QPoint, QTimer, QModelIndex, QItemSelectionModel
+from qgis.PyQt.QtCore import (
+    Qt, QSize, QPoint, QTimer, QModelIndex, QItemSelection, QItemSelectionModel,
+)
 from qgis.core import (
     Qgis, QgsLayerTreeLayer, QgsLayerTreeGroup, QgsMessageLog, QgsProject,
     QgsVectorLayer,
@@ -27,11 +29,15 @@ except AttributeError:
 try:
     NoFocus = Qt.FocusPolicy.NoFocus
 except AttributeError:
-    NoFocus = getattr(Qt, "NoFocus")
+    NoFocus = getattr(Qt, "FocusPolicy", Qt).NoFocus
 
 SelectionFlag = getattr(QItemSelectionModel, "SelectionFlag", QItemSelectionModel)
 ClearAndSelect = getattr(SelectionFlag, "ClearAndSelect")
 Rows = getattr(SelectionFlag, "Rows")
+NoUpdate = getattr(SelectionFlag, "NoUpdate")
+
+SelectionMode = getattr(QAbstractItemView, "SelectionMode", QAbstractItemView)
+ExtendedSelection = getattr(SelectionMode, "ExtendedSelection")
 
 StyleState = getattr(QStyle, "StateFlag", QStyle)
 StateActive = getattr(StyleState, "State_Active")
@@ -87,6 +93,9 @@ class VisibleLayers:
         self.act_toggle_auto = None
         self._auto_timer = None
         self._action_added_to_menu = False
+        self._syncing = False           # re-entrancy guard for selection sync
+        self._view_sel_model = None     # selection model of tree_view
+        self._native_sel_model = None   # selection model of the native Layers panel
 
     # ── helpers ────────────────────────────────────────────────────────────
 
@@ -180,14 +189,138 @@ class VisibleLayers:
             level,
         )
 
-    def _sync_current_layer(self, layer):
+    def _native_index(self, lt_view, node):
+        """Index of *node* in the native Layers view (which sits on a proxy
+        model over the shared QgsLayerTreeModel), or an invalid index."""
+        try:
+            idx = self._src_model.node2index(node)
+            model = lt_view.model()
+            if model is not None and model is not self._src_model:
+                idx = model.mapFromSource(idx)
+            return idx
+        except (AttributeError, RuntimeError, TypeError):
+            return QModelIndex()
+
+    def _push_selection_to_native(self):
+        """Copy this panel's selection (layers + groups) to the native Layers
+        panel, so its context menu / actions act on the whole multi-selection.
+        Caller must hold the self._syncing guard."""
+        lt_view = self.iface.layerTreeView()
+        if lt_view is None or self.tree_view is None or self._src_model is None:
+            return
+        try:
+            view_sm = self.tree_view.selectionModel()
+            native_sm = lt_view.selectionModel()
+            if view_sm is None or native_sm is None:
+                return
+            selection = QItemSelection()
+            for idx in view_sm.selectedIndexes():
+                if idx.column() != 0:
+                    continue
+                node = self._node_at(idx)
+                if node is None:
+                    continue
+                native_idx = self._native_index(lt_view, node)
+                if native_idx.isValid():
+                    selection.select(native_idx, native_idx)
+            native_sm.select(selection, ClearAndSelect | Rows)
+        except (AttributeError, RuntimeError, TypeError) as exc:
+            self._log_ignored_exception("Could not push selection to native panel", exc)
+
+    def _on_view_selection_changed(self, *_):
+        """Selection changed in this panel -> mirror it to the native panel."""
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            self._push_selection_to_native()
+        finally:
+            self._syncing = False
+
+    def _mirror_native_selection(self, *_):
+        """Native Layers panel selection / current layer changed -> mirror it
+        into this panel (multi-selection included)."""
+        if self._syncing or self.tree_view is None or self._src_model is None:
+            return
+        lt_view = self.iface.layerTreeView()
+        if lt_view is None:
+            return
+        self._syncing = True
+        try:
+            view_sm = self.tree_view.selectionModel()
+            if view_sm is None:
+                return
+            selection = QItemSelection()
+            for node in lt_view.selectedNodes():
+                idx = self._src_model.node2index(node)
+                if idx.isValid():
+                    selection.select(idx, idx)
+            view_sm.select(selection, ClearAndSelect | Rows)
+
+            # Current index only (NoUpdate keeps the multi-selection intact).
+            current_idx = QModelIndex()
+            layer = lt_view.currentLayer()
+            if layer:
+                node = self._src_model.rootGroup().findLayer(layer.id())
+                if node is not None:
+                    current_idx = self._src_model.node2index(node)
+            view_sm.setCurrentIndex(current_idx, NoUpdate)
+        except (AttributeError, RuntimeError, TypeError) as exc:
+            self._log_ignored_exception("Could not mirror native selection", exc)
+        finally:
+            self._syncing = False
+
+    def _connect_selection_signals(self):
+        """(Re)connect both selection models. Needed again whenever a view's
+        setModel() replaces its selection model (e.g. on project load)."""
+        for attr, getter in (
+            ("_view_sel_model", lambda: self.tree_view.selectionModel()
+                if self.tree_view else None),
+            ("_native_sel_model", lambda: self.iface.layerTreeView().selectionModel()
+                if self.iface.layerTreeView() else None),
+        ):
+            old = getattr(self, attr)
+            slot = (self._on_view_selection_changed if attr == "_view_sel_model"
+                    else self._mirror_native_selection)
+            if old is not None:
+                try:
+                    old.selectionChanged.disconnect(slot)
+                except (RuntimeError, TypeError) as exc:
+                    self._log_ignored_exception("Could not disconnect signal", exc)
+            new = getter()
+            if new is not None:
+                new.selectionChanged.connect(slot)
+            setattr(self, attr, new)
+
+    def _disconnect_selection_signals(self):
+        for attr, slot in (
+            ("_view_sel_model", self._on_view_selection_changed),
+            ("_native_sel_model", self._mirror_native_selection),
+        ):
+            sel_model = getattr(self, attr)
+            if sel_model is not None:
+                try:
+                    sel_model.selectionChanged.disconnect(slot)
+                except (RuntimeError, TypeError) as exc:
+                    self._log_ignored_exception("Could not disconnect signal", exc)
+            setattr(self, attr, None)
+
+    def _sync_current_layer(self, layer, set_active=True):
         """Make a Visible Layers click behave like a native Layers panel click."""
         if not layer:
             return
         # Qt's default click handling already updated this view's own
         # current/selected index (see _create_dock for why the two views
         # can't just share one selection model).
-        self.iface.setActiveLayer(layer)
+        if set_active:
+            # setActiveLayer() resets the native selection to that single
+            # layer, so re-push our (possibly multi-)selection right after.
+            self._syncing = True
+            try:
+                self.iface.setActiveLayer(layer)
+                self._push_selection_to_native()
+            finally:
+                self._syncing = False
 
         # Move real keyboard focus to the native layer tree view. Confirmed
         # necessary: QGIS's copy/paste-features workflow does not work
@@ -201,33 +334,6 @@ class VisibleLayers:
                 lt_view.setFocus()
             except (AttributeError, RuntimeError, TypeError) as exc:
                 self._log_ignored_exception("Could not focus layer tree view", exc)
-
-    def _on_native_layer_changed(self, layer):
-        """Mirror a native Layers panel selection change into this panel.
-
-        Without this, clicking a different layer natively left this panel's
-        own (independent) selection pointing at whatever was last clicked
-        here, which reads as if that stale layer were still active.
-        """
-        if self.tree_view is None or self._src_model is None:
-            return
-        try:
-            if not layer:
-                self.tree_view.clearSelection()
-                self.tree_view.setCurrentIndex(QModelIndex())
-                return
-            node = self._src_model.rootGroup().findLayer(layer.id())
-            if node is None:
-                return
-            idx = self._src_model.node2index(node)
-            if not idx.isValid():
-                return
-            self.tree_view.setCurrentIndex(idx)
-            selection_model = self.tree_view.selectionModel()
-            if selection_model:
-                selection_model.select(idx, ClearAndSelect | Rows)
-        except (AttributeError, RuntimeError, TypeError) as exc:
-            self._log_ignored_exception("Could not mirror native layer selection", exc)
 
     # ── initGui / unload ──────────────────────────────────────────────────
 
@@ -265,9 +371,10 @@ class VisibleLayers:
             lt_view = self.iface.layerTreeView()
             if lt_view:
                 try:
-                    lt_view.currentLayerChanged.disconnect(self._on_native_layer_changed)
+                    lt_view.currentLayerChanged.disconnect(self._mirror_native_selection)
                 except (RuntimeError, TypeError) as exc:
                     self._log_ignored_exception("Could not disconnect signal", exc)
+        self._disconnect_selection_signals()
 
         self._disconnect_model_signals()
 
@@ -420,8 +527,12 @@ class VisibleLayers:
         # model that targets a different model. Sync explicitly instead,
         # in both directions:
         # Visible Layers click -> native panel: _sync_current_layer()
-        # Native panel click -> Visible Layers: _on_native_layer_changed()
-        lt_view.currentLayerChanged.connect(self._on_native_layer_changed)
+        # Native panel click -> Visible Layers: _mirror_native_selection()
+        # Multi-selection (Ctrl/Cmd/Shift-click) is mirrored the same way,
+        # through both views' selectionChanged signals.
+        self.tree_view.setSelectionMode(ExtendedSelection)
+        lt_view.currentLayerChanged.connect(self._mirror_native_selection)
+        self._connect_selection_signals()
 
         self.tree_view.header().setVisible(False)
         self.tree_view.setIndentation(14)
@@ -533,6 +644,7 @@ class VisibleLayers:
             self._disconnect_model_signals()   # disconnects both always-on and auto-refresh
             self._src_model = new_model
             self.tree_view.setModel(self._src_model)
+            self._connect_selection_signals()   # setModel() made a new selection model
             if self.auto_refresh_enabled:
                 self._connect_model_signals()
         self._refresh_hidden()
@@ -599,7 +711,11 @@ class VisibleLayers:
     def _on_clicked(self, idx):
         node = self._node_at(idx)
         if isinstance(node, QgsLayerTreeLayer):
-            self._sync_current_layer(node.layer())
+            # A Ctrl/Cmd-click that *deselected* this layer must not make it
+            # the active layer; only refocus the native panel in that case.
+            view_sm = self.tree_view.selectionModel() if self.tree_view else None
+            still_selected = view_sm is None or view_sm.isSelected(idx)
+            self._sync_current_layer(node.layer(), set_active=still_selected)
 
     def _on_double_clicked(self, idx):
         node = self._node_at(idx)
@@ -639,7 +755,12 @@ class VisibleLayers:
 
         elif isinstance(node, QgsLayerTreeGroup):
             if lt_view:
-                lt_view.setCurrentIndex(idx)
+                # Make the right-clicked group the native current node (the
+                # selection itself was already mirrored by selectionChanged).
+                native_idx = self._native_index(lt_view, node)
+                native_sm = lt_view.selectionModel()
+                if native_sm is not None and native_idx.isValid():
+                    native_sm.setCurrentIndex(native_idx, NoUpdate)
                 provider = lt_view.menuProvider()
                 if provider:
                     menu = provider.createContextMenu()
