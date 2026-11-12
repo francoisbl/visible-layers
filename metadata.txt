@@ -12,7 +12,7 @@ homepage=https://github.com/francoisbl/visible_layers
 tracker=https://github.com/francoisbl/visible_layers/issues
 repository=https://github.com/francoisbl/visible_layers
 tags=layers, visibility, dock, interface, toggle, navigation, productivity
-changelog= 1.4.0 - Added multi-selection (Ctrl/Cmd-click, Shift-click) synced with the native Layers panel, so context-menu actions apply to all selected layers.
+changelog= 1.4.0 - Added multi-selection synced with the Layers panel, so context-menu actions apply to all selected layers.
   1.3.6 - Fixed layer activation sync with the native Layers panel (selection, focus, copy/paste).
   1.3.5 - Fixed Qt6 compatibility checker warnings for enum fallbacks.
   1.3.4 - Addressed security scanner findings by replacing silent exception handling with QGIS message logging.
